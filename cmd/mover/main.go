@@ -20,6 +20,10 @@ type MoveTableRes struct {
 	TableName   string `db:"table_name"`
 }
 
+//--from-shard-connstring="user=etien host=localhost port=5432 dbname=postgres" --to-shard-connstring="user=etien host=localhost port=5432 dbname=etien" --lower-bound=1 --upper-bound=3 --sharding-key="id"
+
+//go run cmd/mover/main.go --from-shard-connstring="user=etien host=localhost port=5432 dbname=postgres" --to-shard-connstring="user=etien host=localhost port=5432 dbname=etien" --lower-bound=2 --upper-bound=4 --sharding-key="r1"
+
 var fromShardConnst = flag.String("from-shard-connstring", "", "")
 var toShardConnst = flag.String("to-shard-connstring", "", "")
 var lb = flag.String("lower-bound", "", "")
@@ -35,7 +39,7 @@ type ProxyW struct {
 }
 
 func (p *ProxyW) Write(bt []byte) (int, error) {
-	spqrlog.Logger.Printf(spqrlog.ERROR, "got bytes %v", bt)
+	spqrlog.Logger.Printf(spqrlog.DEBUG3, "got bytes %v", bt)
 	return p.w.Write(bt)
 }
 
@@ -51,14 +55,14 @@ func moveData(ctx context.Context, from, to *pgx.Conn, keyRange kr.KeyRange, key
 	defer func(txTo pgx.Tx) {
 		err := txTo.Rollback(ctx)
 		if err != nil {
-			spqrlog.Logger.PrintError(err)
+			spqrlog.Logger.Printf(spqrlog.WARNING, "error closing transaction: %v", err)
 		}
 	}(txTo)
 
 	defer func(txFrom pgx.Tx) {
 		err := txFrom.Rollback(ctx)
 		if err != nil {
-			spqrlog.Logger.PrintError(err)
+			spqrlog.Logger.Printf(spqrlog.WARNING, "error closing transaction: %v", err)
 		}
 	}(txFrom)
 
@@ -66,11 +70,10 @@ func moveData(ctx context.Context, from, to *pgx.Conn, keyRange kr.KeyRange, key
 SELECT table_schema, table_name
 FROM information_schema.columns
 WHERE column_name=$1;
-`, key.Entries()[0])
+`, key.Entries()[0].Column)
 	if err != nil {
 		return err
 	}
-
 	var ress []MoveTableRes
 
 	for rows.Next() {
@@ -86,7 +89,7 @@ WHERE column_name=$1;
 	rows.Close()
 
 	for _, v := range ress {
-		spqrlog.Logger.Printf(spqrlog.ERROR, "moving table %s:%s", v.TableSchema, v.TableName)
+		spqrlog.Logger.Printf(spqrlog.DEBUG3, "moving table %s:%s", v.TableSchema, v.TableName)
 
 		r, w, err := os.Pipe()
 		if err != nil {
@@ -97,23 +100,10 @@ WHERE column_name=$1;
 			w: w,
 		}
 
-		ch := make(chan struct{})
-
-		go func() {
-			spqrlog.Logger.Printf(spqrlog.ERROR, "sending rows to dest shard")
-			_, err := txTo.Conn().PgConn().CopyFrom(ctx,
-				r, fmt.Sprintf("COPY %s.%s FROM STDIN", v.TableSchema, v.TableName))
-			if err != nil {
-				spqrlog.Logger.Printf(spqrlog.ERROR, "copy in failed %v", err)
-			}
-
-			ch <- struct{}{}
-		}()
-
 		qry := fmt.Sprintf("copy (delete from %s.%s WHERE %s >= %s and %s <= %s returning *) to stdout", v.TableSchema, v.TableName,
-			key.Entries()[0], keyRange.LowerBound, key.Entries()[0], keyRange.UpperBound)
+			key.Entries()[0].Column, keyRange.LowerBound, key.Entries()[0].Column, keyRange.UpperBound)
 
-		spqrlog.Logger.Printf(spqrlog.ERROR, "executing %v", qry)
+		spqrlog.Logger.Printf(spqrlog.DEBUG3, "executing %v", qry)
 
 		_, err = txFrom.Conn().PgConn().CopyTo(ctx, &pw, qry)
 		if err != nil {
@@ -124,9 +114,15 @@ WHERE column_name=$1;
 			spqrlog.Logger.Printf(spqrlog.ERROR, "error closing pipe %v", err)
 		}
 
-		spqrlog.Logger.Printf(spqrlog.ERROR, "copy cmd executed")
+		spqrlog.Logger.Printf(spqrlog.DEBUG3, "sending rows to dest shard")
+		_, err = txTo.Conn().PgConn().CopyFrom(ctx,
+			r, fmt.Sprintf("COPY %s.%s FROM STDIN", v.TableSchema, v.TableName))
+		if err != nil {
+			spqrlog.Logger.Printf(spqrlog.ERROR, "copy in failed %v", err)
+			return err
+		}
 
-		<-ch
+		spqrlog.Logger.Printf(spqrlog.DEBUG3, "copy cmd executed")
 	}
 
 	_ = txTo.Commit(ctx)
@@ -156,6 +152,10 @@ func main() {
 		spqrlog.Logger.PrintError(err)
 		return
 	}
+
+	entrys := []shrule.ShardingRuleEntry{*shrule.NewShardingRuleEntry("id", "nohash")}
+	my_rule := shrule.NewShardingRule("r1", "fast", entrys)
+	db.AddShardingRule(context.TODO(), shrule.ShardingRuleToDB(my_rule))
 
 	shRule, err := db.GetShardingRule(context.TODO(), *shkey)
 	if err != nil {
