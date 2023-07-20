@@ -492,7 +492,12 @@ func (qc *qdbCoordinator) Move(ctx context.Context, req *kr.MoveKeyRange) error 
 	if err != nil {
 		return err
 	}
-	defer datatransfers.RollbackTransactions(ctx)
+	defer func(ctx context.Context) {
+		err := datatransfers.RollbackTransactions(ctx)
+		if err != nil {
+			spqrlog.Logger.Printf(spqrlog.WARNING, "failed to close transactions %v", err)
+		}
+	}(ctx)
 
 	if err := qc.traverseRouters(ctx, func(cc *grpc.ClientConn) error {
 		cl := routerproto.NewKeyRangeServiceClient(cc)
