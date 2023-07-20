@@ -6,6 +6,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/pg-sharding/spqr/pkg/datatransfers"
 	"github.com/pg-sharding/spqr/pkg/meta"
 	"github.com/pg-sharding/spqr/pkg/models/topology"
 	"github.com/pg-sharding/spqr/pkg/shard"
@@ -473,6 +474,26 @@ func (qc *qdbCoordinator) Unite(ctx context.Context, uniteKeyRange *kr.UniteKeyR
 // Move key range from one logical shard to another
 func (qc *qdbCoordinator) Move(ctx context.Context, req *kr.MoveKeyRange) error {
 	spqrlog.Logger.Printf(spqrlog.DEBUG4, "qdb coordinator dropping all sharding keys")
+
+	keyRange, _ := qc.db.GetKeyRange(ctx, req.Krid)
+	shardingRules, _ := qc.ListShardingRules(ctx)
+	err := datatransfers.BeginTransactions(ctx, keyRange.ShardID, req.ShardId)
+	if err != nil {
+		return err
+	}
+
+	for _, rule := range shardingRules {
+		err = datatransfers.MoveKeys(ctx, *keyRange, rule)
+		if err != nil {
+			return err
+		}
+	}
+	err = datatransfers.CommitTransactions(ctx)
+	if err != nil {
+		return err
+	}
+	defer datatransfers.RollbackTransactions(ctx)
+
 	if err := qc.traverseRouters(ctx, func(cc *grpc.ClientConn) error {
 		cl := routerproto.NewKeyRangeServiceClient(cc)
 		lockResp, err := cl.LockKeyRange(ctx, &routerproto.LockKeyRangeRequest{
@@ -523,7 +544,6 @@ func (qc *qdbCoordinator) Move(ctx context.Context, req *kr.MoveKeyRange) error 
 			return err
 		}
 		spqrlog.Logger.Printf(spqrlog.DEBUG4, "lock key range response %v", lockResp)
-
 		defer func() {
 			unlockResp, err := cl.UnlockKeyRange(ctx, &routerproto.UnlockKeyRangeRequest{
 				Id: []string{req.Krid},
@@ -533,7 +553,6 @@ func (qc *qdbCoordinator) Move(ctx context.Context, req *kr.MoveKeyRange) error 
 			}
 			spqrlog.Logger.Printf(spqrlog.DEBUG4, "unlock key range response %v", unlockResp)
 		}()
-
 		moveResp, err := cl.MoveKeyRange(ctx, &routerproto.MoveKeyRangeRequest{
 			KeyRange: kr.KeyRangeFromDB(krmv).ToProto(),
 		})
@@ -542,7 +561,6 @@ func (qc *qdbCoordinator) Move(ctx context.Context, req *kr.MoveKeyRange) error 
 	}); err != nil {
 		return err
 	}
-	// do phyc keys move
 	return nil
 }
 
